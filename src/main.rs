@@ -1,4 +1,5 @@
 use tokio::sync::mpsc;
+use types::Command;
 
 mod peer;
 mod types;
@@ -24,11 +25,31 @@ async fn main() {
     });
 
     commands
-        .send(types::Command::get_blocks(Vec::new()))
+        .send(Command::get_blocks(Vec::new()))
         .await
         .unwrap();
 
+    let mut blocks = Vec::new();
+
     while let Some(message) = rx.recv().await {
-        log::info!("⚡️ {:?}", message);
+        match message {
+            types::Event::NewBlock(block) => {
+                blocks.push(block);
+            }
+            types::Event::AllBlocksFetched => {
+                log::info!("⚡️ All {} blocks fetched.", blocks.len());
+                commands
+                    .send(Command::get_blocks(
+                        blocks
+                            .iter()
+                            .rev()
+                            .take(10)
+                            .map(|b| b.block_hash())
+                            .collect(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
     }
 }

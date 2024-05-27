@@ -33,6 +33,7 @@ pub struct Peer {
     listeners: Vec<mpsc::Sender<Event>>,
     commands: mpsc::Receiver<Command>,
     command_sender: mpsc::Sender<Command>,
+    waiting_blocks: u32,
 }
 
 impl Peer {
@@ -45,6 +46,7 @@ impl Peer {
             listeners: Vec::new(),
             commands: rx,
             command_sender: tx,
+            waiting_blocks: 0,
         })
     }
 
@@ -159,8 +161,14 @@ impl Peer {
             NetworkMessage::Inv(inv) => self.inventory(inv).await,
             NetworkMessage::Block(block) => {
                 log::debug!("Block data: {:?}", block);
+                self.waiting_blocks -= 1;
                 for tx in self.listeners.iter() {
                     tx.send(Event::NewBlock(block.clone())).await.unwrap();
+                }
+                if self.waiting_blocks == 0 {
+                    for tx in self.listeners.iter() {
+                        tx.send(Event::AllBlocksFetched).await.unwrap();
+                    }
                 }
             }
             _ => log::warn!("Unknown message: {:?}", msg),
@@ -179,6 +187,13 @@ impl Peer {
     async fn inventory(&mut self, inv: &[message_blockdata::Inventory]) {
         self.send_message(NetworkMessage::GetData(inv.to_vec()))
             .await;
+
+        inv.iter().for_each(|i| {
+            if let bitcoin::p2p::message_blockdata::Inventory::Block(_) = i {
+                self.waiting_blocks += 1;
+            }
+        });
+
         // for i in inv {
         //     match i {
         //         bitcoin::p2p::message_blockdata::Inventory::Block(hash) => {

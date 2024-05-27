@@ -1,8 +1,11 @@
+use std::str::FromStr;
+
 use bitcoin::{blockdata::block::Block, hashes::Hash, p2p::message_blockdata, BlockHash};
 
 #[derive(Debug)]
 pub enum Event {
     NewBlock(Block),
+    AllBlocksFetched,
 }
 
 #[derive(Debug)]
