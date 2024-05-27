@@ -1,3 +1,4 @@
+use bitcoin::consensus::encode::Error;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
 use bitcoin::io::Cursor;
@@ -14,12 +15,12 @@ use tokio::io::{AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
 
 #[derive(Debug)]
-pub enum Error {
+pub enum PeerError {
     // /// Can't reach the peer.
     PeerUnreachable(io::Error),
 }
 
-async fn connect_tcp(addr: &str) -> Result<TcpStream, Error> {
+async fn connect_tcp(addr: &str) -> Result<TcpStream, PeerError> {
     match TcpStream::connect(addr).await {
         Ok(conn) => {
             log::info!("Connected to peer: {}", addr);
@@ -27,7 +28,7 @@ async fn connect_tcp(addr: &str) -> Result<TcpStream, Error> {
         }
         Err(e) => {
             log::error!("Failed to connect to peer: {}", e);
-            Err(Error::PeerUnreachable(e))
+            Err(PeerError::PeerUnreachable(e))
         }
     }
 }
@@ -130,17 +131,19 @@ async fn pong(stream: &mut TcpStream, n: u64) {
     send_message(stream, NetworkMessage::Pong(n)).await;
 }
 
-async fn handle_read(stream: &mut TcpStream, n: usize, buf: Vec<u8>) {
+async fn handle_read(n: usize, buf: &mut Vec<u8>) -> Vec<RawNetworkMessage> {
     let mut v = &buf[..n];
     let mut cursor = Cursor::new(&mut v);
+    let mut messages = Vec::new();
+    let mut pos = cursor.position() as usize;
     loop {
-        // let pos = cursor.position() as usize;
         let raw_msg = match RawNetworkMessage::consensus_decode(&mut cursor) {
-            Ok(msg) => msg,
-            Err(bitcoin::consensus::encode::Error::Io(ref e))
-                if e.kind() == ErrorKind::UnexpectedEof =>
-            {
-                log::error!("Buffer too small to read message: {}", e);
+            Ok(msg) => {
+                pos = cursor.position() as usize;
+                msg
+            }
+            Err(Error::Io(ref e)) if e.kind() == ErrorKind::UnexpectedEof => {
+                log::debug!("Missing end of message in buffer, waiting for more data");
                 break;
             }
             Err(e) => {
@@ -148,16 +151,15 @@ async fn handle_read(stream: &mut TcpStream, n: usize, buf: Vec<u8>) {
                 break;
             }
         };
-        handle_message(stream, raw_msg).await;
+        messages.push(raw_msg);
 
-        if cursor.position() as usize == n {
+        if pos == n {
             break;
         }
     }
-    match RawNetworkMessage::consensus_decode(&mut v) {
-        Ok(msg) => handle_message(stream, msg).await,
-        Err(e) => log::error!("Failed to decode message: {}", e),
-    }
+
+    buf.drain(..pos);
+    messages
 }
 
 #[tokio::main]
@@ -173,6 +175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     handshake(&mut stream).await;
 
+    let mut buf = Vec::with_capacity(1024 * 1024);
+
     loop {
         let ready = stream
             .ready(Interest::READABLE | Interest::WRITABLE | Interest::ERROR)
@@ -183,15 +187,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if ready.is_readable() {
-            let mut buf = Vec::with_capacity(4096);
             match stream.try_read_buf(&mut buf) {
                 Ok(0) => {
                     log::info!("Connection closed by remote");
                     return Ok(());
                 }
-                Ok(n) => {
-                    log::debug!("read {} bytes", n);
-                    handle_read(&mut stream, n, buf).await;
+                Ok(_) => {
+                    let messages = handle_read(buf.len(), &mut buf).await;
+                    for msg in messages {
+                        handle_message(&mut stream, msg).await;
+                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     continue;
