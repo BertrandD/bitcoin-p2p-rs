@@ -1,11 +1,14 @@
 use bitcoin::consensus::encode::Error;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
+use bitcoin::hashes::Hash;
 use bitcoin::io::Cursor;
 use bitcoin::io::ErrorKind;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message_blockdata;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin::BlockHash;
 use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -16,6 +19,7 @@ use tokio::io::{AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::types::Command;
 use crate::types::Event;
 
 #[derive(Debug)]
@@ -27,15 +31,20 @@ pub enum PeerError {
 pub struct Peer {
     stream: TcpStream,
     listeners: Vec<mpsc::Sender<Event>>,
+    commands: mpsc::Receiver<Command>,
+    command_sender: mpsc::Sender<Command>,
 }
 
 impl Peer {
     pub async fn new(addr: &str) -> Result<Peer, PeerError> {
         let stream = Peer::connect_tcp(addr).await?;
+        let (tx, rx) = mpsc::channel(100);
 
         Ok(Peer {
             stream,
             listeners: Vec::new(),
+            commands: rx,
+            command_sender: tx,
         })
     }
 
@@ -72,7 +81,20 @@ impl Peer {
                     return Err(e.into());
                 }
             }
+
+            if let Ok(command) = self.commands.try_recv() {
+                match command {
+                    Command::GetBlocks(cmd) => {
+                        self.send_message(NetworkMessage::GetBlocks(cmd.as_message()))
+                            .await;
+                    }
+                }
+            }
         }
+    }
+
+    pub fn add_command_sender(&self) -> mpsc::Sender<Command> {
+        self.command_sender.clone()
     }
 
     pub fn add_listener(&mut self, tx: mpsc::Sender<Event>) {
@@ -154,33 +176,31 @@ impl Peer {
         self.stream.write_all(buf.get_ref()).await.unwrap();
     }
 
-    async fn get_data(&mut self, data: bitcoin::p2p::message_blockdata::Inventory) {
-        self.send_message(NetworkMessage::GetData(vec![data])).await;
-    }
-
-    async fn inventory(&mut self, inv: &Vec<bitcoin::p2p::message_blockdata::Inventory>) {
-        for i in inv {
-            match i {
-                bitcoin::p2p::message_blockdata::Inventory::Block(hash) => {
-                    log::debug!("Block: {}", hash);
-                    self.get_data(*i).await;
-                }
-                bitcoin::p2p::message_blockdata::Inventory::Transaction(hash) => {
-                    log::debug!("Transaction: {}", hash);
-                }
-                bitcoin::p2p::message_blockdata::Inventory::CompactBlock(hash) => {
-                    log::debug!("CompactBlock: {}", hash);
-                }
-                bitcoin::p2p::message_blockdata::Inventory::WTx(id) => log::info!("WTx: {}", id),
-                bitcoin::p2p::message_blockdata::Inventory::WitnessTransaction(id) => {
-                    log::debug!("WitnessTransaction: {}", id)
-                }
-                bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(hash) => {
-                    log::debug!("WitnessBlock: {}", hash)
-                }
-                _ => log::warn!("Unknown inventory type"),
-            }
-        }
+    async fn inventory(&mut self, inv: &[message_blockdata::Inventory]) {
+        self.send_message(NetworkMessage::GetData(inv.to_vec()))
+            .await;
+        // for i in inv {
+        //     match i {
+        //         bitcoin::p2p::message_blockdata::Inventory::Block(hash) => {
+        //             log::debug!("Block: {}", hash);
+        //             self.get_data(*i).await;
+        //         }
+        //         bitcoin::p2p::message_blockdata::Inventory::Transaction(hash) => {
+        //             log::debug!("Transaction: {}", hash);
+        //         }
+        //         bitcoin::p2p::message_blockdata::Inventory::CompactBlock(hash) => {
+        //             log::debug!("CompactBlock: {}", hash);
+        //         }
+        //         bitcoin::p2p::message_blockdata::Inventory::WTx(id) => log::info!("WTx: {}", id),
+        //         bitcoin::p2p::message_blockdata::Inventory::WitnessTransaction(id) => {
+        //             log::debug!("WitnessTransaction: {}", id)
+        //         }
+        //         bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(hash) => {
+        //             log::debug!("WitnessBlock: {}", hash)
+        //         }
+        //         _ => log::warn!("Unknown inventory type"),
+        //     }
+        // }
     }
 
     async fn handshake(&mut self) {

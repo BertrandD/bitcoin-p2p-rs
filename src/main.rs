@@ -10,16 +10,23 @@ async fn main() {
         .parse_env("RUST_LOG")
         .init();
 
+    let mut peer = peer::Peer::new("127.0.0.1:18444").await.unwrap();
+    let commands = peer.add_command_sender();
+
     let (tx, mut rx) = mpsc::channel(100);
 
     tokio::spawn(async move {
-        let mut peer = peer::Peer::new("127.0.0.1:18444").await.unwrap();
         peer.add_listener(tx);
         match peer.start().await {
             Ok(_) => log::info!("Peer thread finished"),
             Err(e) => log::error!("Peer thread failed: {}", e),
         }
     });
+
+    commands
+        .send(types::Command::get_blocks(Vec::new()))
+        .await
+        .unwrap();
 
     while let Some(message) = rx.recv().await {
         log::info!("⚡️ {:?}", message);
