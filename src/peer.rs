@@ -11,8 +11,12 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+
+use crate::types::Event;
 
 #[derive(Debug)]
 pub enum PeerError {
@@ -22,13 +26,17 @@ pub enum PeerError {
 
 pub struct Peer {
     stream: TcpStream,
+    listeners: Vec<mpsc::Sender<Event>>,
 }
 
 impl Peer {
     pub async fn new(addr: &str) -> Result<Peer, PeerError> {
         let stream = Peer::connect_tcp(addr).await?;
 
-        Ok(Peer { stream })
+        Ok(Peer {
+            stream,
+            listeners: Vec::new(),
+        })
     }
 
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -46,27 +54,29 @@ impl Peer {
                 panic!("Error on stream");
             }
 
-            if ready.is_readable() {
-                match self.stream.try_read_buf(&mut buf) {
-                    Ok(0) => {
-                        log::info!("Connection closed by remote");
-                        return Ok(());
+            match self.stream.read_buf(&mut buf).await {
+                Ok(0) => {
+                    log::info!("Connection closed by remote");
+                    return Ok(());
+                }
+                Ok(_) => {
+                    let messages = Peer::handle_read(buf.len(), &mut buf).await;
+                    for msg in messages {
+                        self.handle_message(msg).await;
                     }
-                    Ok(_) => {
-                        let messages = Peer::handle_read(buf.len(), &mut buf).await;
-                        for msg in messages {
-                            self.handle_message(msg).await;
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(e.into());
-                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e.into());
                 }
             }
         }
+    }
+
+    pub fn add_listener(&mut self, tx: mpsc::Sender<Event>) {
+        self.listeners.push(tx);
     }
 
     async fn connect_tcp(addr: &str) -> Result<TcpStream, PeerError> {
@@ -108,8 +118,8 @@ impl Peer {
         msg
     }
 
-    async fn handle_message(self: &mut Peer, msg: RawNetworkMessage) {
-        log::info!("RECV: {}", msg.cmd());
+    async fn handle_message(&mut self, msg: RawNetworkMessage) {
+        log::debug!("RECV: {}", msg.cmd());
         match msg.payload() {
             NetworkMessage::Version(_) => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -125,13 +135,18 @@ impl Peer {
             }
             NetworkMessage::Ping(n) => self.pong(*n).await,
             NetworkMessage::Inv(inv) => self.inventory(inv).await,
-            NetworkMessage::Block(block) => log::info!("Block data: {:?}", block),
+            NetworkMessage::Block(block) => {
+                log::debug!("Block data: {:?}", block);
+                for tx in self.listeners.iter() {
+                    tx.send(Event::NewBlock(block.clone())).await.unwrap();
+                }
+            }
             _ => log::warn!("Unknown message: {:?}", msg),
         }
     }
 
-    async fn send_message(self: &mut Peer, msg: NetworkMessage) {
-        log::info!("SEND: {}", msg.cmd());
+    async fn send_message(&mut self, msg: NetworkMessage) {
+        log::debug!("SEND: {}", msg.cmd());
         let raw_msg = RawNetworkMessage::new(Magic::REGTEST, msg);
         let mut buf = std::io::BufWriter::new(Vec::new());
         raw_msg.consensus_encode(&mut buf).unwrap();
@@ -139,36 +154,36 @@ impl Peer {
         self.stream.write_all(buf.get_ref()).await.unwrap();
     }
 
-    async fn get_data(self: &mut Peer, data: bitcoin::p2p::message_blockdata::Inventory) {
+    async fn get_data(&mut self, data: bitcoin::p2p::message_blockdata::Inventory) {
         self.send_message(NetworkMessage::GetData(vec![data])).await;
     }
 
-    async fn inventory(self: &mut Peer, inv: &Vec<bitcoin::p2p::message_blockdata::Inventory>) {
+    async fn inventory(&mut self, inv: &Vec<bitcoin::p2p::message_blockdata::Inventory>) {
         for i in inv {
             match i {
                 bitcoin::p2p::message_blockdata::Inventory::Block(hash) => {
-                    log::info!("Block: {}", hash);
+                    log::debug!("Block: {}", hash);
                     self.get_data(*i).await;
                 }
                 bitcoin::p2p::message_blockdata::Inventory::Transaction(hash) => {
-                    log::info!("Transaction: {}", hash);
+                    log::debug!("Transaction: {}", hash);
                 }
                 bitcoin::p2p::message_blockdata::Inventory::CompactBlock(hash) => {
-                    log::info!("CompactBlock: {}", hash);
+                    log::debug!("CompactBlock: {}", hash);
                 }
                 bitcoin::p2p::message_blockdata::Inventory::WTx(id) => log::info!("WTx: {}", id),
                 bitcoin::p2p::message_blockdata::Inventory::WitnessTransaction(id) => {
-                    log::info!("WitnessTransaction: {}", id)
+                    log::debug!("WitnessTransaction: {}", id)
                 }
                 bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(hash) => {
-                    log::info!("WitnessBlock: {}", hash)
+                    log::debug!("WitnessBlock: {}", hash)
                 }
                 _ => log::warn!("Unknown inventory type"),
             }
         }
     }
 
-    async fn handshake(self: &mut Peer) {
+    async fn handshake(&mut self) {
         let addr = self.stream.peer_addr().unwrap();
         let loc_addr = self.stream.local_addr().unwrap();
         let block_height = 0;
@@ -177,7 +192,7 @@ impl Peer {
         self.send_message(version_msg).await;
     }
 
-    async fn pong(self: &mut Peer, n: u64) {
+    async fn pong(&mut self, n: u64) {
         self.send_message(NetworkMessage::Pong(n)).await;
     }
 

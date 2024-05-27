@@ -1,4 +1,7 @@
+use tokio::sync::mpsc;
+
 mod peer;
+mod types;
 
 #[tokio::main]
 async fn main() {
@@ -7,11 +10,18 @@ async fn main() {
         .parse_env("RUST_LOG")
         .init();
 
-    let peer = peer::Peer::new("127.00.1:18444").await;
-    match peer {
-        Ok(mut p) => p.start().await.unwrap(),
-        Err(e) => {
-            log::error!("Error creating peer: {:?}", e);
+    let (tx, mut rx) = mpsc::channel(100);
+
+    tokio::spawn(async move {
+        let mut peer = peer::Peer::new("127.0.0.1:18444").await.unwrap();
+        peer.add_listener(tx);
+        match peer.start().await {
+            Ok(_) => log::info!("Peer thread finished"),
+            Err(e) => log::error!("Peer thread failed: {}", e),
         }
+    });
+
+    while let Some(message) = rx.recv().await {
+        log::info!("⚡️ {:?}", message);
     }
 }
