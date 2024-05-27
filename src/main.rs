@@ -1,5 +1,7 @@
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
+use bitcoin::io::Cursor;
+use bitcoin::io::ErrorKind;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
@@ -68,7 +70,7 @@ async fn handle_message(stream: &mut TcpStream, msg: RawNetworkMessage) {
             std::str::from_utf8(data)
                 .map(|s| log::info!("Alert message: {}", s))
                 .unwrap_or_else(|_| {
-                    log::info!("Failed to decode utf8: {:?}", data);
+                    log::error!("Failed to decode alert message: {:?}", data);
                 });
         }
         NetworkMessage::Ping(n) => pong(stream, *n).await,
@@ -128,6 +130,36 @@ async fn pong(stream: &mut TcpStream, n: u64) {
     send_message(stream, NetworkMessage::Pong(n)).await;
 }
 
+async fn handle_read(stream: &mut TcpStream, n: usize, buf: Vec<u8>) {
+    let mut v = &buf[..n];
+    let mut cursor = Cursor::new(&mut v);
+    loop {
+        // let pos = cursor.position() as usize;
+        let raw_msg = match RawNetworkMessage::consensus_decode(&mut cursor) {
+            Ok(msg) => msg,
+            Err(bitcoin::consensus::encode::Error::Io(ref e))
+                if e.kind() == ErrorKind::UnexpectedEof =>
+            {
+                log::error!("Buffer too small to read message: {}", e);
+                break;
+            }
+            Err(e) => {
+                log::error!("Failed to decode message: {}", e);
+                break;
+            }
+        };
+        handle_message(stream, raw_msg).await;
+
+        if cursor.position() as usize == n {
+            break;
+        }
+    }
+    match RawNetworkMessage::consensus_decode(&mut v) {
+        Ok(msg) => handle_message(stream, msg).await,
+        Err(e) => log::error!("Failed to decode message: {}", e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::formatted_builder()
@@ -159,11 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(n) => {
                     log::debug!("read {} bytes", n);
-                    let mut v = &buf[..n];
-                    match RawNetworkMessage::consensus_decode(&mut v) {
-                        Ok(msg) => handle_message(&mut stream, msg).await,
-                        Err(e) => log::error!("Failed to decode message: {}", e),
-                    }
+                    handle_read(&mut stream, n, buf).await;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     continue;
