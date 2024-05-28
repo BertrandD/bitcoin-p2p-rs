@@ -1,10 +1,14 @@
-use bitcoin::{blockdata::block::Block, hashes::Hash, p2p::message_blockdata, BlockHash};
+use bitcoin::{
+    blockdata::block::Block, hashes::Hash, p2p::message_blockdata, BlockHash, Transaction,
+};
 
 #[derive(Debug)]
 pub enum Event {
     Connected,
     NewBlock(Block),
+    NewTx(Transaction),
     AllBlocksFetched,
+    AllTxsFetched,
 }
 
 #[derive(Debug)]
@@ -26,6 +30,7 @@ impl GetBlocksCommand {
 #[derive(Debug)]
 pub enum Command {
     GetBlocks(GetBlocksCommand),
+    GetMempool,
 }
 
 impl Command {

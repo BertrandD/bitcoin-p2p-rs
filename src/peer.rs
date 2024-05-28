@@ -33,6 +33,7 @@ pub struct Peer {
     commands: mpsc::Receiver<Command>,
     command_sender: mpsc::Sender<Command>,
     waiting_blocks: u32,
+    waiting_transactions: u32,
 }
 
 impl Peer {
@@ -46,6 +47,7 @@ impl Peer {
             commands: rx,
             command_sender: tx,
             waiting_blocks: 0,
+            waiting_transactions: 0,
         })
     }
 
@@ -97,6 +99,9 @@ impl Peer {
                                 self.send_message(NetworkMessage::GetBlocks(cmd.as_message()))
                                     .await;
                             }
+                            Command::GetMempool => {
+                                self.send_message(NetworkMessage::MemPool).await;
+                            }
                         }
                     }
                 }
@@ -144,7 +149,7 @@ impl Peer {
             nonce: rand::random(),
             user_agent: "bitcoin-p2p-rs".parse().unwrap(),
             start_height: start_height as i32,
-            relay: false,
+            relay: true,
         };
 
         log::debug!("Prepared version message ({}): {:?}", addr, msg);
@@ -171,6 +176,17 @@ impl Peer {
             }
             NetworkMessage::Ping(n) => self.pong(*n).await,
             NetworkMessage::Inv(inv) => self.inventory(inv).await,
+            NetworkMessage::Tx(transac) => {
+                self.waiting_transactions -= 1;
+                for tx in self.listeners.iter() {
+                    tx.send(Event::NewTx(transac.clone())).await.unwrap();
+                }
+                if self.waiting_transactions == 0 {
+                    for tx in self.listeners.iter() {
+                        tx.send(Event::AllTxsFetched).await.unwrap();
+                    }
+                }
+            }
             NetworkMessage::Block(block) => {
                 log::trace!("Block data: {:?}", block);
                 self.waiting_blocks -= 1;
@@ -203,6 +219,8 @@ impl Peer {
         inv.iter().for_each(|i| {
             if let bitcoin::p2p::message_blockdata::Inventory::Block(_) = i {
                 self.waiting_blocks += 1;
+            } else if let bitcoin::p2p::message_blockdata::Inventory::Transaction(_) = i {
+                self.waiting_transactions += 1;
             }
         });
 

@@ -2,6 +2,7 @@ use tokio::sync::mpsc;
 use types::Command;
 
 mod blockchain;
+mod mempool;
 mod peer;
 mod types;
 
@@ -26,32 +27,51 @@ async fn main() {
         }
     });
 
-    let mut blockchain = blockchain::Blockchain::new();
+    let mut mempool = mempool::Mempool::new();
 
     while let Some(message) = rx.recv().await {
         match message {
             types::Event::Connected => {
-                commands
-                    .send(Command::get_blocks(Vec::new()))
-                    .await
-                    .unwrap();
+                log::info!("🔃 Fetching mempool");
+                commands.send(Command::GetMempool).await.unwrap();
             }
-            types::Event::NewBlock(block) => {
-                blockchain.add_block(block);
+            types::Event::NewTx(tx) => {
+                log::info!("📥 New transaction: {}", tx.txid());
+                mempool.add_transaction(tx);
             }
-            types::Event::AllBlocksFetched => {
-                let len_before = blockchain.len();
-                blockchain.commit();
-                if len_before != blockchain.len() {
-                    log::info!("⛓️  Blockchain height: {}", blockchain.len());
-
-                    let last_blocks = blockchain.last_blocks(10);
-                    commands
-                        .send(Command::get_blocks(last_blocks))
-                        .await
-                        .unwrap();
-                }
+            types::Event::AllTxsFetched => {
+                log::info!("📬 Mempool size: {}", mempool.size());
             }
+            _ => {}
         }
     }
+
+    // let mut blockchain = blockchain::Blockchain::new();
+    //
+    // while let Some(message) = rx.recv().await {
+    //     match message {
+    //         types::Event::Connected => {
+    //             commands
+    //                 .send(Command::get_blocks(Vec::new()))
+    //                 .await
+    //                 .unwrap();
+    //         }
+    //         types::Event::NewBlock(block) => {
+    //             blockchain.add_block(block);
+    //         }
+    //         types::Event::AllBlocksFetched => {
+    //             let len_before = blockchain.len();
+    //             blockchain.commit();
+    //             if len_before != blockchain.len() {
+    //                 log::info!("⛓️  Blockchain height: {}", blockchain.len());
+    //
+    //                 let last_blocks = blockchain.last_blocks(10);
+    //                 commands
+    //                     .send(Command::get_blocks(last_blocks))
+    //                     .await
+    //                     .unwrap();
+    //             }
+    //         }
+    //     }
+    // }
 }
