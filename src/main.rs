@@ -1,11 +1,13 @@
 use tokio::sync::mpsc;
 use types::Command;
 
+mod blockchain;
 mod peer;
 mod types;
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
     pretty_env_logger::formatted_builder()
         .filter_level(log::LevelFilter::Debug)
         .parse_env("RUST_LOG")
@@ -24,31 +26,31 @@ async fn main() {
         }
     });
 
-    commands
-        .send(Command::get_blocks(Vec::new()))
-        .await
-        .unwrap();
-
-    let mut blocks = Vec::new();
+    let mut blockchain = blockchain::Blockchain::new();
 
     while let Some(message) = rx.recv().await {
         match message {
-            types::Event::NewBlock(block) => {
-                blocks.push(block);
-            }
-            types::Event::AllBlocksFetched => {
-                log::info!("⚡️ All {} blocks fetched.", blocks.len());
+            types::Event::Connected => {
                 commands
-                    .send(Command::get_blocks(
-                        blocks
-                            .iter()
-                            .rev()
-                            .take(10)
-                            .map(|b| b.block_hash())
-                            .collect(),
-                    ))
+                    .send(Command::get_blocks(Vec::new()))
                     .await
                     .unwrap();
+            }
+            types::Event::NewBlock(block) => {
+                blockchain.add_block(block);
+            }
+            types::Event::AllBlocksFetched => {
+                let len_before = blockchain.len();
+                blockchain.commit();
+                if len_before != blockchain.len() {
+                    log::info!("⛓️  Blockchain height: {}", blockchain.len());
+
+                    let last_blocks = blockchain.last_blocks(10);
+                    commands
+                        .send(Command::get_blocks(last_blocks))
+                        .await
+                        .unwrap();
+                }
             }
         }
     }

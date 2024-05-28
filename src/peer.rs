@@ -1,14 +1,12 @@
 use bitcoin::consensus::encode::Error;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::Hash;
 use bitcoin::io::Cursor;
 use bitcoin::io::ErrorKind;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
-use bitcoin::BlockHash;
 use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -17,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
+use tokio::select;
 use tokio::sync::mpsc;
 
 use crate::types::Command;
@@ -65,30 +64,40 @@ impl Peer {
                 panic!("Error on stream");
             }
 
-            match self.stream.read_buf(&mut buf).await {
-                Ok(0) => {
-                    log::info!("Connection closed by remote");
-                    return Ok(());
-                }
-                Ok(_) => {
-                    let messages = Peer::handle_read(buf.len(), &mut buf).await;
-                    for msg in messages {
-                        self.handle_message(msg).await;
+            let wait_tcp = self.stream.read_buf(&mut buf);
+            let wait_cmd = self.commands.recv();
+
+            select! {
+                res = wait_tcp => {
+                   match res {
+                        Ok(0) => {
+                            log::info!("Connection closed by remote");
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            let messages = Peer::handle_read(buf.len(), &mut buf).await;
+                            for msg in messages {
+                                self.handle_message(msg).await;
+                            }
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(e.into());
+                        }
                     }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
-
-            if let Ok(command) = self.commands.try_recv() {
-                match command {
-                    Command::GetBlocks(cmd) => {
-                        self.send_message(NetworkMessage::GetBlocks(cmd.as_message()))
-                            .await;
+                res = wait_cmd => {
+                    log::debug!("Received command: {:?}", res);
+                    if let Some(command) = res {
+                        match command {
+                            Command::GetBlocks(cmd) => {
+                                log::debug!("GetBlocks command: {:?}", cmd);
+                                self.send_message(NetworkMessage::GetBlocks(cmd.as_message()))
+                                    .await;
+                            }
+                        }
                     }
                 }
             }
@@ -138,16 +147,19 @@ impl Peer {
             relay: false,
         };
 
-        log::info!("Prepared version message ({}): {:?}", addr, msg);
+        log::debug!("Prepared version message ({}): {:?}", addr, msg);
         msg
     }
 
     async fn handle_message(&mut self, msg: RawNetworkMessage) {
-        log::debug!("RECV: {}", msg.cmd());
+        log::trace!("RECV: {} {:?}", msg.cmd(), msg);
         match msg.payload() {
             NetworkMessage::Version(_) => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 self.send_message(NetworkMessage::Verack).await;
+                for tx in self.listeners.iter() {
+                    tx.send(Event::Connected).await.unwrap();
+                }
             }
             NetworkMessage::Verack => {}
             NetworkMessage::Alert(data) => {
@@ -160,7 +172,7 @@ impl Peer {
             NetworkMessage::Ping(n) => self.pong(*n).await,
             NetworkMessage::Inv(inv) => self.inventory(inv).await,
             NetworkMessage::Block(block) => {
-                log::debug!("Block data: {:?}", block);
+                log::trace!("Block data: {:?}", block);
                 self.waiting_blocks -= 1;
                 for tx in self.listeners.iter() {
                     tx.send(Event::NewBlock(block.clone())).await.unwrap();
@@ -176,7 +188,7 @@ impl Peer {
     }
 
     async fn send_message(&mut self, msg: NetworkMessage) {
-        log::debug!("SEND: {}", msg.cmd());
+        log::trace!("SEND: {} {:?}", msg.cmd(), msg);
         let raw_msg = RawNetworkMessage::new(Magic::REGTEST, msg);
         let mut buf = std::io::BufWriter::new(Vec::new());
         raw_msg.consensus_encode(&mut buf).unwrap();
@@ -243,7 +255,7 @@ impl Peer {
                     msg
                 }
                 Err(Error::Io(ref e)) if e.kind() == ErrorKind::UnexpectedEof => {
-                    log::debug!("Missing end of message in buffer, waiting for more data");
+                    log::trace!("Missing end of message in buffer, waiting for more data");
                     break;
                 }
                 Err(e) => {
