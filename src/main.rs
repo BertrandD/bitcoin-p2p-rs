@@ -36,7 +36,7 @@ async fn main() {
                 commands.send(Command::GetMempool).await.unwrap();
             }
             types::Event::NewTx(tx) => {
-                log::info!("📥 New transaction: {}", tx.txid());
+                log::info!("📥 New transaction: {}", tx.compute_txid());
                 mempool.add_transaction(tx);
             }
             types::Event::AllTxsFetched => {
